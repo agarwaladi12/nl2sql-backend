@@ -1,7 +1,6 @@
 # backend/app/langchain_nl2sql.py
 import os
 from langchain.prompts import PromptTemplate
-from langchain.memory import ConversationBufferMemory
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.output_parsers import StrOutputParser
 
@@ -14,20 +13,25 @@ def get_gemini_llm(model="gemini-1.5-flash"):
     )
 
 SQL_PROMPT = PromptTemplate(
-    input_variables=["user_query", "recent_history", "schema_text"],
+    input_variables=["user_query", "last_sql", "schema_text"],
     template="""
 You are converting a natural language request into a single valid PostgreSQL SELECT statement.
-Use only SELECT queries, make string comparisons case-insensitive with LOWER(TRIM(column)).
-Prefer table-qualified column names when needed.
-In follow-up questions, refine or modify the last SQL query instead of starting over.
-Use the sample values provided to match strings exactly as they appear in the database.
-Prefer simple, efficient SQL. Use LIMIT when the user asks for a number of results.
-Use joins if possible after understanding the schema provided do not include columns in where clause which are not present in that table. Read schema correctly.
+
+Rules:
+- Only generate SELECT queries.
+- Use joins whenever queries involve multiple tables, rather than placing unrelated columns in WHERE.
+- Always check the schema carefully before using a column.
+- Make string comparisons case-insensitive with LOWER(TRIM(column)).
+- Prefer table-qualified column names when needed.
+- In follow-up questions, refine or modify the LAST SQL query instead of starting over.
+- Use LIMIT when the user asks for a number of results.
+- Return efficient, readable SQL.
+
 Database schema:
 {schema_text}
 
-Recent user queries & results:
-{recent_history}
+Last SQL query (if any):
+{last_sql}
 
 User request: {user_query}
 
@@ -35,17 +39,23 @@ Return ONLY the final SQL query using single quotes for literals.
 """
 )
 
-# Memory (still used, but you can also fetch from DB instead)
-memory = ConversationBufferMemory(
-    memory_key="recent_history",
-    input_key="user_query",
-    return_messages=True
-)
+# Track only the *last SQL* for refinement
+memory = {"last_sql": ""}
 
 def create_sql_chain(schema_text: str):
     llm = get_gemini_llm()
     output_parser = StrOutputParser()
-
-    # RunnableSequence instead of deprecated LLMChain
     chain = SQL_PROMPT | llm | output_parser
     return chain
+
+def run_sql_chain(chain, schema_text, user_query):
+    # Inject last_sql into the prompt
+    generated_sql = chain.invoke({
+        "user_query": user_query,
+        "last_sql": memory.get("last_sql", ""),
+        "schema_text": schema_text
+    }).strip()
+
+    # Update memory with the newly generated SQL
+    memory["last_sql"] = generated_sql
+    return generated_sql

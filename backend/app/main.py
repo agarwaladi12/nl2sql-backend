@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from .database import get_engine, get_db_schema, execute_sql, init_query_history_table, log_query_history, fetch_history
-from .langchain_nl2sql import create_sql_chain, memory
+from .langchain_nl2sql import create_sql_chain, run_sql_chain, memory  # import run_sql_chain
 
 app = FastAPI(title="NL2SQL with LangChain + Gemini + History")
 
@@ -25,7 +25,6 @@ def clean_sql(sql: str) -> str:
     """Remove any Markdown code fences from LLM output."""
     sql = sql.strip()
     if sql.startswith("```") and sql.endswith("```"):
-        # remove ```sql or ``` at start and ``` at end
         sql = "\n".join(sql.split("\n")[1:-1])
     return sql.strip()
 
@@ -40,32 +39,27 @@ def run_query(req: QueryRequest):
         init_query_history_table(engine)
         schema_text = build_schema_text(engine)
 
-        # Multi-turn chain
+        # Use our refined chain
         chain = create_sql_chain(schema_text)
-        history = memory.load_memory_variables({}).get("history", "")
-        print("MEMORY DUMP:", memory.load_memory_variables({}))
-        raw_sql = chain.invoke({
-            "user_query": req.query,
-            "schema_text": schema_text,
-            "recent_history": memory.load_memory_variables({}).get("recent_history", "")
-        })
-        
-        # clean it
-        generated_sql = clean_sql(raw_sql)
-        
-        memory.save_context(
-            {"user_query": req.query},
-            {"generated_sql": generated_sql}
-        )
-        
-        print(generated_sql)
 
+        print("MEMORY DUMP:", memory)
+
+        # Run the chain with refinement
+        raw_sql = run_sql_chain(chain, schema_text, req.query)
+        generated_sql = clean_sql(raw_sql)
+
+        print("Generated SQL:", generated_sql)
+
+        # Execute SQL
         results = execute_sql(engine, generated_sql)
+
+        # Log history
         hist_row = log_query_history(
             engine, req.user_id, req.db_name,
             req.query, generated_sql, results
         )
 
+        # Keep session history in memory
         SESSION_HISTORY.setdefault(req.user_id, []).append({
             "id": hist_row["id"],
             "prompt": req.query,
