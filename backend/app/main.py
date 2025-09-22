@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from .database import get_engine, get_db_schema, execute_sql, init_query_history_table, log_query_history, fetch_history
-from .langchain_nl2sql import create_sql_chain, run_sql_chain, memory  # import run_sql_chain
+from .langchain_nl2sql import create_sql_chain, run_sql_chain, memory  # updated imports
 
 app = FastAPI(title="NL2SQL with LangChain + Gemini + History")
 
@@ -39,18 +39,22 @@ def run_query(req: QueryRequest):
         init_query_history_table(engine)
         schema_text = build_schema_text(engine)
 
-        # Use our refined chain
+        # Create SQL chain
         chain = create_sql_chain(schema_text)
 
         print("MEMORY DUMP:", memory)
 
-        # Run the chain with refinement
-        raw_sql = run_sql_chain(chain, schema_text, req.query)
-        generated_sql = clean_sql(raw_sql)
-
+        # Run the chain (may request clarification)
+        # Use the new run_sql_chain return format
+        result = run_sql_chain(chain, schema_text, req.query)
+        
+        if result.get("clarification_required"):
+            return {"message": result["message"], "clarification_required": True}
+        
+        # Otherwise, execute SQL
+        generated_sql = clean_sql(result["sql"])
         print("Generated SQL:", generated_sql)
 
-        # Execute SQL
         results = execute_sql(engine, generated_sql)
 
         # Log history
@@ -70,6 +74,7 @@ def run_query(req: QueryRequest):
             SESSION_HISTORY[req.user_id] = SESSION_HISTORY[req.user_id][-200:]
 
         return {
+            "clarification_required": False,
             "sql": generated_sql,
             "results": results,
             "history_id": hist_row["id"]
@@ -78,10 +83,10 @@ def run_query(req: QueryRequest):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/history/{user_id}")
+@app.get("/history/{user_id}/{db_name}")
 def get_history_api(user_id: str, limit: int = 20, db_name: Optional[str] = None):
     try:
-        db_name = db_name or "imdb_movies"
+        db_name = db_name
         engine = get_engine(db_name)
         init_query_history_table(engine)
         rows = fetch_history(engine, user_id, limit=limit)
