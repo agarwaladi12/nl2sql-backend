@@ -5,3 +5,8 @@
 *.json
 
 test.py
+
+faiss_sql_index/
+
+backend/.DS_Store
+.DS_Store

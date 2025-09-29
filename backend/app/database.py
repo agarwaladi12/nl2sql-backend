@@ -17,12 +17,25 @@ def get_database_url(db_name: str) -> str:
 def get_engine(db_name: str):
     return create_engine(get_database_url(db_name))
 
-def get_db_schema(engine) -> Dict[str, List[str]]:
+def get_db_schema(engine) -> Dict[str, List[Dict[str, Any]]]:
+    """
+    Returns full table schema including:
+    name, type, nullable, default
+    """
     inspector = inspect(engine)
     schema_info = {}
+
     for table_name in inspector.get_table_names():
-        columns = [col["name"] for col in inspector.get_columns(table_name)]
+        columns = []
+        for col in inspector.get_columns(table_name):
+            columns.append({
+                "name": col["name"],
+                "type": str(col["type"]),      # capture SQL type
+                "nullable": col.get("nullable", True),
+                "default": col.get("default")  # sometimes None
+            })
         schema_info[table_name] = columns
+
     return schema_info
 
 def json_serial(obj):
@@ -33,10 +46,17 @@ def json_serial(obj):
     raise TypeError(f"Type {type(obj)} not serializable")
 
 def execute_sql(engine: Engine, sql: str):
-    with engine.connect() as conn:
+    # Auto-commit using a transaction context
+    with engine.begin() as conn:  # engine.begin() starts a transaction and commits automatically
         result = conn.execute(text(sql))
-        rows = [dict(r._mapping) for r in result.fetchall()]
-    return json.loads(json.dumps(rows, default=json_serial))
+
+        # SELECT query → fetch results
+        if sql.strip().lower().startswith("select"):
+            rows = [dict(r._mapping) for r in result.fetchall()]
+            return json.loads(json.dumps(rows, default=str))  # use str for json_serial fallback
+
+        # DML query → return affected row count
+        return result.rowcount
 
 def init_query_history_table(engine: Engine):
     query = """

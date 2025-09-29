@@ -8,7 +8,7 @@ from langchain_community.vectorstores import FAISS
 # -------------------------------
 # LLM setup
 # -------------------------------
-def get_gemini_llm(model="gemini-2.5-flash-lite"):
+def get_gemini_llm(model="gemini-2.5-flash"):
     return ChatGoogleGenerativeAI(
         model=model,
         temperature=0,
@@ -16,22 +16,40 @@ def get_gemini_llm(model="gemini-2.5-flash-lite"):
     )
 
 # -------------------------------
-# SQL Prompt
+# SQL Prompt (supports SELECT & DML)
 # -------------------------------
 SQL_PROMPT = PromptTemplate(
     input_variables=["user_query", "last_sql", "schema_text", "context"],
     template="""
-You are converting a natural language request into a single valid PostgreSQL SELECT statement.
+You are converting a natural language request into a valid PostgreSQL SQL query.
 
 Rules:
-- Only generate SELECT queries.
-- Use joins whenever queries involve multiple tables, rather than placing unrelated columns in WHERE.
-- Always check the schema carefully before using a column.
+- Generate SELECT, INSERT, UPDATE, DELETE, MERGE/UPSERT queries as required.
+- Use joins whenever queries involve multiple tables.
+- Always check the schema before using columns.
 - Make string comparisons case-insensitive with LOWER(TRIM(column)).
-- Prefer table-qualified column names when needed.
-- In follow-up questions, refine or modify the LAST SQL query instead of starting over.
-- Use LIMIT when the user asks for a number of results.
+- Table-qualified column names preferred when needed.
+- Use LIMIT when user requests number of results.
 - Return efficient, readable SQL.
+Hard Rules:
+1. Always use the provided database schema to validate table and column names.
+2. For INSERT or UPDATE:
+   - Always include all columns marked as required in the schema. 
+   - For required columns, generate realistic placeholder data if not provided in the user query.
+   - Never omit required columns, even if the user only specifies one field.
+3. Do not ask clarifying questions. If user input is incomplete, still generate a valid SQL using placeholders.
+4. Provide **structured JSON output** with two keys:
+   - "sql": the final SQL query.
+   - "suggestions": a list of suggestions to improve the SQL (e.g., include indexes, optimize joins, avoid NULLs if possible).
+
+Example JSON output:
+{{
+    "sql": "INSERT INTO country (code, name, continent) VALUES ('TST', 'TestLand', 'Asia');",
+    "suggestions": [
+        "Consider adding population and capital columns if required by schema.",
+        "Ensure the country code is unique to avoid conflicts."
+    ]
+}}
 
 Database schema:
 {schema_text}
@@ -44,19 +62,19 @@ Relevant past queries/SQL (if useful):
 
 User request: {user_query}
 
-Return ONLY the final SQL query using single quotes for literals.
+Return **ONLY valid JSON** as shown in the example.
 """
 )
 
 # -------------------------------
 # Memory: multi-turn short-term + long-term
 # -------------------------------
-memory = {
-    "history": [],           # last n queries + SQL
-    "max_history": 10        # configurable
-}
+memory = {"history": [], "max_history": 10}
 
-embedding_model = GoogleGenerativeAIEmbeddings(model="models/gemini-embedding-001", google_api_key=os.getenv("GEMINI_API_KEY"))
+embedding_model = GoogleGenerativeAIEmbeddings(
+    model="models/gemini-embedding-001",
+    google_api_key=os.getenv("GEMINI_API_KEY")
+)
 vector_store_path = "faiss_sql_index"
 if os.path.exists(vector_store_path):
     vector_store = FAISS.load_local(
@@ -66,6 +84,9 @@ if os.path.exists(vector_store_path):
     )
 else:
     vector_store = None
+
+memory = {}
+DEFAULT_MAX_HISTORY = 10
 
 # -------------------------------
 # Chain creator
@@ -97,64 +118,69 @@ def validate_sql_with_schema(sql: str, schema_text: str) -> bool:
 # -------------------------------
 # Run SQL chain
 # -------------------------------
-def run_sql_chain(chain, schema_text, user_query):
-    global vector_store  # <--- add this
+def run_sql_chain(chain, schema_text, user_query, user_id):
+    global memory, vector_store
 
-    # Retrieve last N queries as context
+    # Ensure per-user session history
+    if user_id not in memory:
+        memory[user_id] = {"history": [], "max_history": DEFAULT_MAX_HISTORY}
+
+    session_history = memory[user_id]["history"]
+
+    # Short-term context (with flags)
     context_items = [
-        f"Q: {item['query']}\nSQL: {item['sql']}"
-        for item in memory["history"]
+        f"Q: {item['query']}\nSQL: {item['sql']}\nExecuted: {item.get('executed', False)}\nSuggestions: {item.get('suggestions', [])}"
+        for item in session_history
     ]
     context_text = "\n\n".join(context_items)
 
-    # Retrieve long-term memory
-    if vector_store is not None:
-        docs_and_scores = vector_store.similarity_search_with_score(user_query, k=2)
-    else:
-        docs_and_scores = []
-
+    # Long-term context
+    docs_and_scores = vector_store.similarity_search_with_score(user_query, k=2) if vector_store else []
     if docs_and_scores:
         doc_context, score = docs_and_scores[0]
         context_text += f"\n\n{doc_context.page_content}"
-    else:
-        score = 0.0
 
-    # Low confidence → ask clarifying question
-    first_query = len(memory["history"]) == 0
-
-    # Only ask for clarification if NOT first query
-    if not first_query and score < 0.35:
-        clarifier = get_gemini_llm().invoke(
-            f"Ask a clarifying question to better understand this request: {user_query}"
-        )
-        return {"message": clarifier.content, "clarification_required": True}
-    
-    # Otherwise, generate SQL immediately
-    generated_sql = chain.invoke({
+    # Prompt for LLM
+    gemini_prompt = {
         "user_query": user_query,
-        "last_sql": memory["history"][-1]["sql"] if memory["history"] else "",
+        "last_sql": session_history[-1]["sql"] if session_history else "",
         "schema_text": schema_text,
         "context": context_text
-    }).strip()
+    }
+    generated_text = chain.invoke(gemini_prompt).strip()
 
-    # Self-reflection: validate before saving
-    if validate_sql_with_schema(generated_sql, schema_text):
-        # Update short-term memory
-        memory["history"].append({"query": user_query, "sql": generated_sql})
-        if len(memory["history"]) > memory["max_history"]:
-            memory["history"] = memory["history"][-memory["max_history"]:]
+    # Parse JSON output
+    try:
+        import json
+        result = json.loads(generated_text)
+        sql = result.get("sql", "")
+        suggestions = result.get("suggestions", [])
+    except Exception:
+        sql = generated_text
+        suggestions = []
 
-        # Update long-term memory
+    # Detect DML (INSERT/UPDATE/DELETE)
+    is_dml = sql.strip().lower().startswith(("insert", "update", "delete"))
+
+    # Validate SQL
+    if validate_sql_with_schema(sql, schema_text):
+        # Update vector store
         if vector_store is None:
-            vector_store = FAISS.from_texts([f"Q: {user_query}\nSQL: {generated_sql}"], embedding_model)
+            vector_store = FAISS.from_texts([f"Q: {user_query}\nSQL: {sql}"], embedding_model)
         else:
-            vector_store.add_texts([f"Q: {user_query}\nSQL: {generated_sql}"])
+            vector_store.add_texts([f"Q: {user_query}\nSQL: {sql}"])
         vector_store.save_local("faiss_sql_index")
 
-        return {"sql": generated_sql, "clarification_required": False}
+        return {
+            "sql": sql,
+            "suggestions": suggestions,
+            "clarification_required": False,
+            "requires_confirmation": is_dml
+        }
     else:
-        # Ask for clarification instead of guessing
-        clarifier = get_gemini_llm().invoke(
-            f"Ask a clarifying question to better understand this request: {user_query}"
-        )
-        return {"message": clarifier.content, "clarification_required": True}
+        return {
+            "sql": sql,
+            "suggestions": suggestions,
+            "clarification_required": True,
+            "requires_confirmation": is_dml
+        }
